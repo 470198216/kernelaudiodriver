@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * WWJAudio Simple ALSA Sound Card Driver
- * Based on sound/drivers/dummy.c
+ * Compatible with Linux 5.4.x, 5.10.x, 5.15.x, 6.x kernels
  */
 #include <linux/init.h>
 #include <linux/err.h>
@@ -42,7 +42,9 @@ static struct platform_device *wwj_audio_device;
 #define USE_PERIODS_MIN 	2
 #define USE_PERIODS_MAX 	1024
 
-static bool fake_buffer = 1;
+#define WWJAUDIO_USE_MANAGED_BUFFER	(LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0))
+#define WWJAUDIO_USE_DEVM_CARD		(LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0))
+#define WWJAUDIO_USE_PCM_OPS_EXT	(LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0))
 
 struct wwj_audio {
 	struct snd_card *card;
@@ -193,11 +195,6 @@ static int wwj_pcm_hw_params(struct snd_pcm_substream *substream,
 {
 	pr_info("wwjaudio: %s - channels:%d, rate:%d\n", __func__,
 		params_channels(hw_params), params_rate(hw_params));
-
-	if (fake_buffer) {
-		substream->runtime->dma_bytes = params_buffer_bytes(hw_params);
-		return 0;
-	}
 	return 0;
 }
 
@@ -256,6 +253,7 @@ static snd_pcm_uframes_t wwj_pcm_pointer(struct snd_pcm_substream *substream)
 	return wwj_timer_pointer(substream);
 }
 
+#if WWJAUDIO_USE_PCM_OPS_EXT
 static int wwj_pcm_copy(struct snd_pcm_substream *substream,
 			int channel, unsigned long pos,
 			struct iov_iter *iter, unsigned long bytes)
@@ -270,12 +268,10 @@ static int wwj_pcm_silence(struct snd_pcm_substream *substream,
 	return 0;
 }
 
-static void *wwj_page[2];
-
-static struct page *wwj_pcm_get_page(struct snd_pcm_substream *substream,
-				     unsigned long offset)
+static struct page *wwj_pcm_page(struct snd_pcm_substream *substream,
+				 unsigned long offset)
 {
-	return virt_to_page(wwj_page[substream->stream]);
+	return virt_to_page(substream->runtime->dma_area);
 }
 
 static const struct snd_pcm_ops wwj_pcm_ops = {
@@ -285,24 +281,24 @@ static const struct snd_pcm_ops wwj_pcm_ops = {
 	.prepare =	wwj_pcm_prepare,
 	.trigger =	wwj_pcm_trigger,
 	.pointer =	wwj_pcm_pointer,
+	.copy =		wwj_pcm_copy,
+	.fill_silence =	wwj_pcm_silence,
+	.page =		wwj_pcm_page,
 };
-
-static const struct snd_pcm_ops wwj_pcm_ops_no_buf = {
+#else
+static const struct snd_pcm_ops wwj_pcm_ops = {
 	.open =		wwj_pcm_open,
 	.close =	wwj_pcm_close,
 	.hw_params =	wwj_pcm_hw_params,
 	.prepare =	wwj_pcm_prepare,
 	.trigger =	wwj_pcm_trigger,
 	.pointer =	wwj_pcm_pointer,
-	.copy =		wwj_pcm_copy,
-	.fill_silence =	wwj_pcm_silence,
-	.page =		wwj_pcm_get_page,
 };
+#endif
 
 static int wwj_pcm_new(struct wwj_audio *wwj, int device, int substreams)
 {
 	struct snd_pcm *pcm;
-	const struct snd_pcm_ops *ops;
 	int err;
 
 	err = snd_pcm_new(wwj->card, WWJAUDIO_CARD_NAME " PCM", device,
@@ -313,23 +309,23 @@ static int wwj_pcm_new(struct wwj_audio *wwj, int device, int substreams)
 	}
 	wwj->pcm = pcm;
 
-	if (fake_buffer)
-		ops = &wwj_pcm_ops_no_buf;
-	else
-		ops = &wwj_pcm_ops;
-
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, ops);
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, ops);
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &wwj_pcm_ops);
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &wwj_pcm_ops);
 	pcm->private_data = wwj;
 	pcm->info_flags = 0;
 	strcpy(pcm->name, WWJAUDIO_CARD_NAME " PCM");
 
-	if (!fake_buffer) {
-		snd_pcm_set_managed_buffer_all(pcm,
-			SNDRV_DMA_TYPE_CONTINUOUS,
-			NULL,
-			0, 64*1024);
-	}
+#if WWJAUDIO_USE_MANAGED_BUFFER
+	snd_pcm_set_managed_buffer_all(pcm,
+		SNDRV_DMA_TYPE_CONTINUOUS,
+		NULL,
+		0, MAX_BUFFER_SIZE);
+#else
+	snd_pcm_lib_preallocate_pages_for_all(pcm,
+		SNDRV_DMA_TYPE_CONTINUOUS,
+		NULL,
+		0, MAX_BUFFER_SIZE);
+#endif
 
 	return 0;
 }
@@ -350,8 +346,13 @@ static int wwj_audio_probe(struct platform_device *pdev)
 
 	pr_info("wwjaudio: %s - creating sound card\n", __func__);
 
+#if WWJAUDIO_USE_DEVM_CARD
 	err = snd_devm_card_new(&pdev->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
 				THIS_MODULE, sizeof(struct wwj_audio), &card);
+#else
+	err = snd_card_new(&pdev->dev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
+			   THIS_MODULE, sizeof(struct wwj_audio), &card);
+#endif
 	if (err < 0) {
 		pr_err("wwjaudio: failed to create sound card: %d\n", err);
 		return err;
@@ -362,12 +363,20 @@ static int wwj_audio_probe(struct platform_device *pdev)
 	wwj->pcm_hw = wwj_pcm_hw;
 
 	err = wwj_pcm_new(wwj, 0, 1);
-	if (err < 0)
+	if (err < 0) {
+#if !WWJAUDIO_USE_DEVM_CARD
+		snd_card_free(card);
+#endif
 		return err;
+	}
 
 	err = wwj_mixer_new(wwj);
-	if (err < 0)
+	if (err < 0) {
+#if !WWJAUDIO_USE_DEVM_CARD
+		snd_card_free(card);
+#endif
 		return err;
+	}
 
 	strcpy(card->driver, WWJAUDIO_NAME);
 	strcpy(card->shortname, WWJAUDIO_CARD_NAME);
@@ -376,11 +385,23 @@ static int wwj_audio_probe(struct platform_device *pdev)
 	err = snd_card_register(card);
 	if (err < 0) {
 		pr_err("wwjaudio: failed to register sound card: %d\n", err);
+#if !WWJAUDIO_USE_DEVM_CARD
+		snd_card_free(card);
+#endif
 		return err;
 	}
 
 	platform_set_drvdata(pdev, card);
 	pr_info("wwjaudio: sound card registered successfully\n");
+	return 0;
+}
+
+static int wwj_audio_remove(struct platform_device *pdev)
+{
+#if !WWJAUDIO_USE_DEVM_CARD
+	struct snd_card *card = platform_get_drvdata(pdev);
+	snd_card_free(card);
+#endif
 	return 0;
 }
 
@@ -407,57 +428,25 @@ static SIMPLE_DEV_PM_OPS(wwj_audio_pm, wwj_audio_suspend, wwj_audio_resume);
 
 static struct platform_driver wwj_audio_driver = {
 	.probe		= wwj_audio_probe,
+	.remove		= wwj_audio_remove,
 	.driver		= {
 		.name	= WWJAUDIO_NAME,
 		.pm	= WWJAUDIO_PM_OPS,
 	},
 };
 
-static int alloc_fake_buffer(void)
-{
-	int i;
-
-	if (!fake_buffer)
-		return 0;
-	for (i = 0; i < 2; i++) {
-		wwj_page[i] = (void *)get_zeroed_page(GFP_KERNEL);
-		if (!wwj_page[i]) {
-			for (i = i-1; i >= 0; i--)
-				free_page((unsigned long)wwj_page[i]);
-			return -ENOMEM;
-		}
-	}
-	return 0;
-}
-
-static void free_fake_buffer(void)
-{
-	if (fake_buffer) {
-		int i;
-		for (i = 0; i < 2; i++)
-			if (wwj_page[i]) {
-				free_page((unsigned long)wwj_page[i]);
-				wwj_page[i] = NULL;
-			}
-	}
-}
-
 static int __init wwj_audio_init(void)
 {
 	int err;
 
-	pr_info("wwjaudio: %s - initializing\n", __func__);
+	pr_info("wwjaudio: %s - initializing (kernel: %d.%d.%d)\n", __func__,
+		KERNEL_VERSION(LINUX_VERSION_CODE >> 16,
+			       (LINUX_VERSION_CODE >> 8) & 0xFF,
+			       LINUX_VERSION_CODE & 0xFF));
 
 	err = platform_driver_register(&wwj_audio_driver);
 	if (err < 0) {
 		pr_err("wwjaudio: failed to register driver: %d\n", err);
-		return err;
-	}
-
-	err = alloc_fake_buffer();
-	if (err < 0) {
-		pr_err("wwjaudio: failed to allocate fake buffer\n");
-		platform_driver_unregister(&wwj_audio_driver);
 		return err;
 	}
 
@@ -466,7 +455,6 @@ static int __init wwj_audio_init(void)
 	if (IS_ERR(wwj_audio_device)) {
 		err = PTR_ERR(wwj_audio_device);
 		pr_err("wwjaudio: failed to register device: %d\n", err);
-		free_fake_buffer();
 		platform_driver_unregister(&wwj_audio_driver);
 		return err;
 	}
@@ -480,7 +468,6 @@ static void __exit wwj_audio_exit(void)
 	pr_info("wwjaudio: %s - exiting\n", __func__);
 	platform_device_unregister(wwj_audio_device);
 	platform_driver_unregister(&wwj_audio_driver);
-	free_fake_buffer();
 }
 
 module_init(wwj_audio_init);
