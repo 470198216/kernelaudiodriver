@@ -628,6 +628,21 @@ static int dummy_pcm_copy(struct snd_pcm_substream *substream,
 			  int channel, unsigned long pos,
 			  struct iov_iter *iter, unsigned long bytes)
 {
+	// 打印调试信息：位置、数据大小、方向等
+	// 注意：这里不能直接用 %p 打印 iter 指向的用户空间地址，不安全
+	printk(KERN_DEBUG "my_pcm_copy: channel=%d, pos=%lu, count=%lu\n",
+			channel, pos, bytes);
+
+	// 如果需要打印数据内容（仅用于极度谨慎的调试）
+	// 由于 iter 可能指向用户空间，需要用专用函数拷贝到内核空间再打印
+	unsigned char *buf = kmalloc(bytes, GFP_KERNEL);
+	if (buf) {
+		//可以使用copy_from_iter
+	    if (copy_from_iter_full(buf, bytes, iter)) {
+	        print_hex_dump(KERN_DEBUG, "data: ", DUMP_PREFIX_OFFSET, 16, 1, buf, bytes, true);
+	    }
+	    kfree(buf);
+	}
 	return 0; /* do nothing */
 }
 
